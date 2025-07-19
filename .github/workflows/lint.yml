@@ -4,15 +4,44 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
 
+permissions:
+  contents: read
+  pull-requests: write  # For potential future auto-comments
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  validate-config:
+    name: Validate Configuration
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4.2.2
+      
+      - name: Validate required configuration files
+        run: |
+          # Check for required config files in rmcp-python directory
+          if [[ ! -f rmcp-python/pyproject.toml ]]; then
+            echo "::error::rmcp-python/pyproject.toml not found"
+            exit 1
+          fi
+          
+          if [[ ! -f rmcp-python/uv.lock ]]; then
+            echo "::error::rmcp-python/uv.lock not found"
+            exit 1
+          fi
+          
+          echo "✅ All required configuration files present"
+
   ruff-check:
     name: Ruff Check
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    needs: validate-config
 
     steps:
       - name: Checkout code
@@ -22,12 +51,13 @@ jobs:
         uses: astral-sh/ruff-action@v3
         with:
           version: "0.11.10"
-          args: check --no-cache # NOTE: ローカルと動作環境を合わせるために --no-cache を指定している
+          args: check --no-cache rmcp-python # NOTE: ローカルと動作環境を合わせるために --no-cache を指定している
 
   ruff-format:
     name: Ruff Format
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    needs: validate-config
 
     steps:
       - name: Checkout code
@@ -37,12 +67,17 @@ jobs:
         uses: astral-sh/ruff-action@v3
         with:
           version: "0.11.10"
-          args: format --check --no-cache # NOTE: ローカルと動作環境を合わせるために --no-cache を指定している
+          args: format --check --no-cache rmcp-python # NOTE: ローカルと動作環境を合わせるために --no-cache を指定している
 
   mypy:
     name: Mypy static type check
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    needs: validate-config
+    # Using Python 3.12 as pinned version
+    defaults:
+      run:
+        working-directory: rmcp-python
 
     steps:
       - name: Checkout
@@ -52,14 +87,17 @@ jobs:
         uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
-          cache-dependency-glob: "uv.lock"
+          cache-dependency-glob: "rmcp-python/uv.lock"
+          python-version: "3.12"
 
       - name: Restore virtual environment
         id: cache-venv
         uses: actions/cache@v4
         with:
-          path: .venv
-          key: venv-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+          path: rmcp-python/.venv
+          key: venv-${{ runner.os }}-py3.12-${{ hashFiles('rmcp-python/pyproject.toml', 'rmcp-python/uv.lock') }}
+          restore-keys: |
+            venv-${{ runner.os }}-py3.12-
 
       - name: Install the project
         if: steps.cache-venv.outputs.cache-hit != 'true'
@@ -68,8 +106,70 @@ jobs:
       - name: Restore mypy cache
         uses: actions/cache@v4
         with:
-          path: .mypy_cache
-          key: mypy-${{ runner.os }}-${{ hashFiles('**/*.py') }}
+          path: rmcp-python/.mypy_cache
+          key: mypy-${{ runner.os }}-py3.12-${{ hashFiles('rmcp-python/src/**/*.py', 'rmcp-python/pyproject.toml') }}
+          restore-keys: |
+            mypy-${{ runner.os }}-py3.12-
       
       - name: Run mypy on app and tests directories
         run: uv run mypy .
+      
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mypy-logs-${{ runner.os }}-py3.12
+          path: |
+            rmcp-python/.mypy_cache/
+            rmcp-python/*.log
+          retention-days: 7
+
+  test-coverage:
+    name: Test Coverage Validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: validate-config
+    defaults:
+      run:
+        working-directory: rmcp-python
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: "rmcp-python/uv.lock"
+          python-version: "3.12"
+      
+      - name: Restore virtual environment
+        id: cache-venv
+        uses: actions/cache@v4
+        with:
+          path: rmcp-python/.venv
+          key: venv-test-${{ runner.os }}-${{ hashFiles('rmcp-python/pyproject.toml', 'rmcp-python/uv.lock') }}
+          restore-keys: |
+            venv-test-${{ runner.os }}-
+      
+      - name: Install the project
+        if: steps.cache-venv.outputs.cache-hit != 'true'
+        run: uv sync --locked --all-extras --dev
+      
+      - name: Run tests with coverage
+        run: |
+          uv run pytest --cov=src --cov-report=xml --cov-report=term-missing
+      
+      - name: Upload coverage reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: rmcp-python/coverage.xml
+          retention-days: 7
+      
+      - name: Coverage comment (if enabled)
+        # This would require additional setup for PR comments
+        if: false  # Disabled for now
+        run: echo "Coverage reporting available in artifacts"
